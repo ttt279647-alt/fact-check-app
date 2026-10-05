@@ -345,10 +345,20 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
             }
 
             try:
-                res = requests.post(gas_webhook_url, json=payload, timeout=10)
+                headers = {
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                }
+                res = requests.post(
+                    gas_webhook_url,
+                    data=json.dumps(payload),
+                    headers=headers,
+                    allow_redirects=True,
+                    timeout=15
+                )
                 if res.status_code == 200:
                     st.success("✅ スプレッドシートへの保存が完了しました！")
                 else:
-                    st.error(f"保存に失敗しました（ステータスコード: {res.status_code}）")
+                    st.error(f"保存に失敗しました（ステータスコード: {res.status_code} / 応答: {res.text}）")
             except Exception as e:
                 st.error(f"通信エラーが発生しました: {e}")

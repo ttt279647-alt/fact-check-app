@@ -5,12 +5,14 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# ページ設定
+# ページ基本設定
 st.set_page_config(page_title="SNS記事ファクトチェック作成機", layout="wide")
 st.title("📱 SNS記事 ファクトチェッカー")
 
+# 使用モデル
 MODEL_NAME = "gemini-3.8-flash"
 
+# プラットフォームごとの仕様プリセット
 PLATFORM_PRESETS = {
     "X (旧Twitter)": {
         "desc": "短文・要点重視（140〜250文字程度）、ハッシュタグ控えめ、フックの効いた書き出し",
@@ -36,6 +38,7 @@ with st.sidebar:
     )
     st.caption(f"💡 {PLATFORM_PRESETS[selected_platform]['desc']}")
 
+    # X選択時のみリプライ欄生成オプショントグルを表示
     x_include_reply = False
     if selected_platform == "X (旧Twitter)":
         x_include_reply = st.checkbox("🔗 リプライ欄（補足・ツリー）も一緒に作成する", value=True)
@@ -47,12 +50,14 @@ with st.sidebar:
     target_score = st.slider("採用基準スコア（%）", min_value=70, max_value=100, value=95)
     st.caption(f"使用モデル: `{MODEL_NAME}`")
 
+# APIキーの入力検証
 if not api_key:
     st.warning("👈 左側のサイドバーにGemini APIキーを入力してください。")
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
+# 安全にJSONを抽出するパーサー
 def extract_json(text):
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
@@ -70,6 +75,7 @@ theme = st.text_area(
     height=100
 )
 
+# 生成 & チェック実行ボタン
 if st.button("🚀 記事生成 & ファクトチェック開始", type="primary"):
     if not theme.strip():
         st.warning("投稿テーマを入力してください。")
@@ -116,14 +122,17 @@ if st.button("🚀 記事生成 & ファクトチェック開始", type="primary
 
     verify_prompt = f"""あなたは厳格なファクトチェッカーです。
 以下のテキストに含まれる「具体的な事実（年号、数値、名称、因果関係など）」を抽出して検証してください。
-Google検索を活用して各事実の裏取りを行い、必ず以下のJSONスキーマの形式のみを出力してください。
+Google検索ツールを活用して各事実の裏取りを行い、必ず以下のJSONスキーマの形式のみを出力してください。
+各検証項目には、裏取りの根拠としたWebサイトのURLと記事タイトルを必ず含めてください。
 
 {{
   "claims": [
     {{
       "claim": "検証対象の具体的な主張",
       "status": "PASS" または "FAIL" または "UNKNOWN",
-      "reason": "判定理由（検索結果に基づく根拠）"
+      "reason": "判定理由（検索結果に基づく根拠）",
+      "source_title": "参照したWebサイトのタイトル（不明な場合は空文字）",
+      "source_url": "裏取りに使用したWebページのURL（不明な場合は空文字）"
     }}
   ]
 }}
@@ -144,17 +153,15 @@ Google検索を活用して各事実の裏取りを行い、必ず以下のJSON�
         st.session_state["raw_verify_response"] = verify_res.text
         st.session_state["check_result"] = extract_json(verify_res.text)
 
-        # ★ Google検索の実際の参照元（ソースURL）と検索ワードを抽出
+        # 検索クエリと全体の参照チャンクを抽出
         sources = []
         queries = []
         if verify_res.candidates and len(verify_res.candidates) > 0:
             candidate = verify_res.candidates[0]
             if hasattr(candidate, "grounding_metadata") and candidate.grounding_metadata:
                 gm = candidate.grounding_metadata
-                # 実行された検索クエリ
                 if hasattr(gm, "web_search_queries") and gm.web_search_queries:
                     queries = list(gm.web_search_queries)
-                # 参照した実際のWebページ
                 if hasattr(gm, "grounding_chunks") and gm.grounding_chunks:
                     for chunk in gm.grounding_chunks:
                         if hasattr(chunk, "web") and chunk.web:
@@ -194,8 +201,8 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
     else:
         st.error("⚠️ 基準未達または誤り（FAIL）が検出されました。内容を精査してください。")
 
-    # 1. クレーム詳細のアコーディオン
-    with st.expander("🔍 検証された事実項目と判定理由", expanded=not is_passed):
+    # 1. 各クレームごとの判定理由と個別リンク
+    with st.expander("🔍 検証された事実項目と裏取り根拠（個別リンク付き）", expanded=not is_passed):
         if not claims:
             st.write("検証対象となる客観的クレーム（数値や固有名詞など）は検出されませんでした。")
         for i, c in enumerate(claims):
@@ -203,9 +210,15 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
             status_icon = "✅ PASS" if status == "PASS" else ("❌ FAIL" if status == "FAIL" else "⚠️ UNKNOWN")
             st.markdown(f"**[{status_icon}] 事実 {i+1}:** {c.get('claim')}")
             st.caption(f"判定理由: {c.get('reason')}")
+            
+            source_url = c.get("source_url")
+            source_title = c.get("source_title") or "裏取り参照元Webサイト"
+            if source_url and source_url.startswith("http"):
+                st.markdown(f"🔗 **参照ソース:** [{source_title}]({source_url})")
+            st.markdown("---")
 
-    # 2. ★ 実際に参照したWebソースと検索クエリの表示エリア
-    with st.expander("🌐 実際に裏取りで使用したGoogle検索ソース・リンク一覧", expanded=True):
+    # 2. 実行されたGoogle検索クエリと取得元リスト
+    with st.expander("🌐 Google検索の実行ログ・全体ソース一覧", expanded=False):
         queries = st.session_state.get("grounding_queries", [])
         if queries:
             st.markdown("**実行された検索クエリ:**")
@@ -213,15 +226,14 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
 
         sources = st.session_state.get("grounding_sources", [])
         if sources:
-            st.markdown("**参照されたWebサイト（クリックして一次情報を確認できます）:**")
-            for idx, s in enumerate(sources):
+            st.markdown("**検出されたWebソース一覧:**")
+            for s in sources:
                 st.markdown(f"- [{s['title']}]({s['url']})")
-        else:
-            st.caption("※参照ソース情報が取得できませんでした（一般的な一般常識の範囲として判定された可能性があります）。")
 
     st.divider()
-    st.subheader("✍️ 記事の手直し（Human-in-the-Loop）")
 
+    # 人間による手直しエリア
+    st.subheader("✍️ 記事の手直し（Human-in-the-Loop）")
     if st.session_state.get("is_tree_mode", False):
         col_main, col_reply = st.columns(2)
         with col_main:
@@ -243,6 +255,7 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
 
     st.divider()
 
+    # プロンプト確認用デバッグエリア
     with st.expander("🛠️ 実行ログ・送信プロンプトを確認する（デバッグ用）"):
         st.markdown("#### 1. 記事ドラフト生成に送信したプロンプト")
         st.code(st.session_state.get("draft_prompt_sent", ""), language="text")

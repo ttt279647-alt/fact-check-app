@@ -38,7 +38,6 @@ with st.sidebar:
     )
     st.caption(f"💡 {PLATFORM_PRESETS[selected_platform]['desc']}")
 
-    # X選択時のみリプライ欄生成オプショントグルを表示
     x_include_reply = False
     if selected_platform == "X (旧Twitter)":
         x_include_reply = st.checkbox("🔗 リプライ欄（補足・ツリー）も一緒に作成する", value=True)
@@ -83,42 +82,69 @@ if st.button("🚀 記事生成 & ファクトチェック開始", type="primary
 
     preset = PLATFORM_PRESETS[selected_platform]
 
-    # --- Step 1: 記事ドラフト生成 ---
+    # --- Step 1: Web検索を活用した記事ドラフト生成 ---
     status_placeholder = st.empty()
-    status_placeholder.info(f"1/2: {selected_platform}向けに記事ドラフトを生成中...")
+    status_placeholder.info(f"1/2: Google検索で最新情報をリサーチしつつ、{selected_platform}向けに記事ドラフトを生成中...")
 
     if selected_platform == "X (旧Twitter)" and x_include_reply:
-        draft_prompt = f"""X(旧Twitter)向けのツリー形式投稿（親ポスト＋自身のリプライ）を作成してください。
-以下のJSON形式で出力してください。
+        draft_prompt = f"""Google検索を活用して以下のテーマに関する最新の客観的事実やデータを調査し、
+X(旧Twitter)向けのツリー形式投稿（親ポスト＋自身のリプライ）を作成してください。
+必ず以下のJSON形式のみを出力してください（Markdownコードブロックは不要）。
+
 {{
-  "main_post": "1ポスト目の本文（120〜200文字程度。結論やフック、要約）",
+  "main_post": "1ポスト目の本文（120〜200文字程度。結論やフック、最新データの要約）",
   "reply_post": "自身のリプライ欄の本文（140〜240文字程度。詳細データ、背景、考察など）"
 }}
-【テーマ】: {theme}"""
-        draft_res = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=draft_prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        draft_json = extract_json(draft_res.text)
-        st.session_state["main_text"] = draft_json.get("main_post", "")
-        st.session_state["reply_text"] = draft_json.get("reply_post", "")
-        st.session_state["is_tree_mode"] = True
-        full_text = f"【1ポスト目】\n{st.session_state['main_text']}\n\n【リプライ欄】\n{st.session_state['reply_text']}"
+
+【テーマ】:
+{theme}"""
+        try:
+            draft_res = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=draft_prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+            )
+            draft_json = extract_json(draft_res.text)
+            st.session_state["main_text"] = draft_json.get("main_post", "")
+            st.session_state["reply_text"] = draft_json.get("reply_post", "")
+            st.session_state["is_tree_mode"] = True
+            full_text = f"【1ポスト目】\n{st.session_state['main_text']}\n\n【リプライ欄】\n{st.session_state['reply_text']}"
+        except Exception as e:
+            status_placeholder.empty()
+            st.error(f"ドラフト生成でエラーが発生しました: {e}")
+            st.stop()
     else:
-        draft_prompt = f"{preset['prompt_instruction']}\n具体的な数値、年代、固有名詞を含めてください。\n\n【テーマ】: {theme}"
-        draft_res = client.models.generate_content(model=MODEL_NAME, contents=draft_prompt)
-        st.session_state["main_text"] = draft_res.text
-        st.session_state["reply_text"] = ""
-        st.session_state["is_tree_mode"] = False
-        full_text = draft_res.text
+        draft_prompt = f"""Google検索を活用して以下のテーマに関する最新の客観的事実やデータを調査し、
+{preset['prompt_instruction']}
+具体的な数値、年代、固有名詞、客観的事実を積極的に盛り込んでください。
+
+【テーマ】:
+{theme}"""
+        try:
+            draft_res = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=draft_prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+            )
+            st.session_state["main_text"] = draft_res.text
+            st.session_state["reply_text"] = ""
+            st.session_state["is_tree_mode"] = False
+            full_text = draft_res.text
+        except Exception as e:
+            status_placeholder.empty()
+            st.error(f"ドラフト生成でエラーが発生しました: {e}")
+            st.stop()
 
     st.session_state["draft_prompt_sent"] = draft_prompt
     st.session_state["full_text"] = full_text
     st.session_state["platform_used"] = selected_platform
 
-    # --- Step 2: Google検索連動ファクトチェック ---
-    status_placeholder.info("2/2: Google検索を実行して事実関係を検証中...")
+    # --- Step 2: Google検索連動ファクトチェック（裏取り検証） ---
+    status_placeholder.info("2/2: 生成された記事の事実関係をGoogle検索で二重検証中...")
 
     verify_prompt = f"""あなたは厳格なファクトチェッカーです。
 以下のテキストに含まれる「具体的な事実（年号、数値、名称、因果関係など）」を抽出して検証してください。

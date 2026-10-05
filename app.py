@@ -1,7 +1,9 @@
 import os
 import json
 import re
+from datetime import datetime
 import streamlit as st
+import requests
 from google import genai
 from google.genai import types
 
@@ -12,7 +14,7 @@ st.title("📱 SNS記事 ファクトチェッカー")
 # 使用モデル
 MODEL_NAME = "gemini-3.8-flash"
 
-# プラットフォームごとの仕様プリセット
+# プラットフォーム仕様
 PLATFORM_PRESETS = {
     "X (旧Twitter)": {
         "desc": "短文・要点重視（140〜250文字程度）、ハッシュタグ控えめ、フックの効いた書き出し",
@@ -41,22 +43,26 @@ with st.sidebar:
     x_include_reply = False
     if selected_platform == "X (旧Twitter)":
         x_include_reply = st.checkbox("🔗 リプライ欄（補足・ツリー）も一緒に作成する", value=True)
-        if x_include_reply:
-            st.caption("※1投稿目で要約をフックにし、リプライ欄で詳細や考察を展開します。")
 
     st.divider()
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
     target_score = st.slider("採用基準スコア（%）", min_value=70, max_value=100, value=95)
+    
+    st.divider()
+    st.subheader("📊 スプレッドシート連携")
+    gas_webhook_url = st.text_input(
+        "GAS Webhook URL",
+        placeholder="https://script.google.com/macros/s/.../exec",
+        help="Google Apps ScriptでデプロイしたWebアプリURLを貼り付けてください。"
+    )
     st.caption(f"使用モデル: `{MODEL_NAME}`")
 
-# APIキーの入力検証
 if not api_key:
     st.warning("👈 左側のサイドバーにGemini APIキーを入力してください。")
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
-# 安全にJSONを抽出するパーサー
 def extract_json(text):
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
@@ -79,6 +85,15 @@ if st.button("🚀 記事生成 & ファクトチェック開始", type="primary
     if not theme.strip():
         st.warning("投稿テーマを入力してください。")
         st.stop()
+
+    # 連続作成時のゴースト防止：前回データをクリア
+    keys_to_clear = [
+        "main_text", "reply_text", "check_result", "full_text",
+        "grounding_sources", "grounding_queries", "raw_verify_response",
+        "draft_prompt_sent", "verify_prompt_sent", "edit_main", "edit_reply"
+    ]
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
 
     preset = PLATFORM_PRESETS[selected_platform]
 
@@ -142,8 +157,9 @@ X(旧Twitter)向けのツリー形式投稿（親ポスト＋自身のリプラ�
     st.session_state["draft_prompt_sent"] = draft_prompt
     st.session_state["full_text"] = full_text
     st.session_state["platform_used"] = selected_platform
+    st.session_state["input_theme"] = theme
 
-    # --- Step 2: Google検索連動ファクトチェック（裏取り検証） ---
+    # --- Step 2: Google検索連動ファクトチェック ---
     status_placeholder.info("2/2: 生成された記事の事実関係をGoogle検索で二重検証中...")
 
     verify_prompt = f"""あなたは厳格なファクトチェッカーです。
@@ -179,7 +195,6 @@ Google検索ツールを活用して各事実の裏取りを行い、必ず以�
         st.session_state["raw_verify_response"] = verify_res.text
         st.session_state["check_result"] = extract_json(verify_res.text)
 
-        # 検索クエリと全体の参照チャンクを抽出
         sources = []
         queries = []
         if verify_res.candidates and len(verify_res.candidates) > 0:
@@ -264,20 +279,22 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
         col_main, col_reply = st.columns(2)
         with col_main:
             st.markdown("**1️⃣ 親ポスト（メイン）**")
-            edit_main = st.text_area("親ポストの編集", value=st.session_state["main_text"], height=200, key="edit_main")
-            st.caption(f"文字数: {len(edit_main)} 文字")
+            final_main = st.text_area("親ポストの編集", value=st.session_state["main_text"], height=200, key="edit_main")
+            st.caption(f"文字数: {len(final_main)} 文字")
 
         with col_reply:
             st.markdown("**2️⃣ リプライ欄（補足・展開）**")
-            edit_reply = st.text_area("リプライの編集", value=st.session_state["reply_text"], height=200, key="edit_reply")
-            st.caption(f"文字数: {len(edit_reply)} 文字")
+            final_reply = st.text_area("リプライの編集", value=st.session_state["reply_text"], height=200, key="edit_reply")
+            st.caption(f"文字数: {len(final_reply)} 文字")
     else:
-        final_text = st.text_area(
+        final_main = st.text_area(
             "下書きエディタ（編集内容をそのままコピーできます）",
             value=st.session_state["main_text"],
-            height=220
+            height=220,
+            key="edit_main"
         )
-        st.caption(f"文字数: {len(final_text)} 文字")
+        final_reply = ""
+        st.caption(f"文字数: {len(final_main)} 文字")
 
     st.divider()
 
@@ -291,3 +308,47 @@ if "main_text" in st.session_state and "check_result" in st.session_state:
 
         st.markdown("#### 3. ファクトチェックAPIからの生レスポンス（Raw JSON）")
         st.code(st.session_state.get("raw_verify_response", ""), language="json")
+
+    st.divider()
+
+    # --- スプレッドシート保存ボタン ---
+    st.subheader("💾 記録の保存")
+    if st.button("📥 スプレッドシートに保存する", type="secondary"):
+        if not gas_webhook_url:
+            st.error("👈 左側のサイドバーに『GAS Webhook URL』を入力してください。")
+        else:
+            # 1. クレーム一覧を整形
+            claims_formatted = []
+            for i, c in enumerate(claims):
+                s_url = f" ({c.get('source_url')})" if c.get("source_url") else ""
+                claims_formatted.append(f"[{c.get('status')}] {c.get('claim')}\n理由: {c.get('reason')}{s_url}")
+            claims_text = "\n\n".join(claims_formatted)
+
+            # 2. 検索ソース・クエリを整形
+            sources_list = [f"- {s['title']}: {s['url']}" for s in st.session_state.get("grounding_sources", [])]
+            queries_str = "クエリ: " + " / ".join(st.session_state.get("grounding_queries", []))
+            sources_text = queries_str + "\n" + "\n".join(sources_list)
+
+            # 3. プロンプトログを整形
+            prompts_text = f"【ドラフト生成プロンプト】\n{st.session_state.get('draft_prompt_sent', '')}\n\n【ファクトチェックプロンプト】\n{st.session_state.get('verify_prompt_sent', '')}"
+
+            payload = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "platform": st.session_state.get("platform_used", ""),
+                "theme": st.session_state.get("input_theme", ""),
+                "main_post": final_main,
+                "reply_post": final_reply,
+                "claims_text": claims_text,
+                "sources_text": sources_text,
+                "prompts_text": prompts_text,
+                "raw_verify_response": st.session_state.get("raw_verify_response", "")
+            }
+
+            try:
+                res = requests.post(gas_webhook_url, json=payload, timeout=10)
+                if res.status_code == 200:
+                    st.success("✅ スプレッドシートへの保存が完了しました！")
+                else:
+                    st.error(f"保存に失敗しました（ステータスコード: {res.status_code}）")
+            except Exception as e:
+                st.error(f"通信エラーが発生しました: {e}")
